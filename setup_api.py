@@ -4,46 +4,117 @@ Order Block Setup API
 =====================
 Lightweight Flask API deployed to Render.com (free tier).
 Receives setup data from v3_live_runner and model_b_live,
-serves it to Pine Script via request.json().
+serves it to Pine Script via request.seed() (GitHub CSV).
 
-DEPLOY TO RENDER:
-  1. Create a free account at render.com
-  2. New → Web Service → connect your GitHub repo (or paste this file)
-  3. Build command:  pip install flask gunicorn
-  4. Start command:  gunicorn setup_api:app
-  5. Copy the public URL (e.g. https://ob-setups.onrender.com)
-  6. Paste that URL into:
-       - setup_api_client.py  (API_URL)
-       - The Pine Script       (API_URL input)
-
-ENDPOINTS:
-  POST /setup          — add a new setup (called by Python scripts)
-  POST /close          — mark a setup closed when TP/SL hit
-  GET  /setups/<symbol> — Pine Script polls this per bar
-  GET  /health         — uptime check
+CSV files pushed to GitHub:
+  data/<SYMBOL>_prices.csv  — entry, ob_high, ob_low, sl, tp (mapped to open/high/low/close/volume)
+  data/<SYMBOL>_meta.csv    — direction(1/-1), status(1/2/3), rr, source(1/2), timeframe(1/2)
+                              also mapped to open/high/low/close/volume
 """
 
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
 from collections import defaultdict
-import os
+import os, base64, json
+import urllib.request, urllib.error
 
 app = Flask(__name__)
 
-# ── In-memory store ──────────────────────────────────────────────
-# { symbol: [ setup_dict, ... ] }  — newest first, capped at MAX_PER_SYMBOL
 MAX_PER_SYMBOL = 10
 store = defaultdict(list)
 
-# ── Auth ─────────────────────────────────────────────────────────
-# Set API_KEY as an environment variable in Render dashboard.
-# All POST requests must include header:  X-API-Key: <your_key>
-# GET requests (Pine Script) are public — Pine Script can't send headers easily.
-API_KEY = os.environ.get('API_KEY', 'changeme')
+API_KEY       = os.environ.get('API_KEY', 'changeme')
+GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
+GITHUB_REPO   = os.environ.get('GITHUB_REPO', 'waringd/ob-setup-api')
+GITHUB_BRANCH = 'main'
 
 
 def check_auth():
     return request.headers.get('X-API-Key') == API_KEY
+
+
+def github_put(path, content_str, commit_msg):
+    """Create or update a file in the GitHub repo."""
+    if not GITHUB_TOKEN:
+        print("[GITHUB] No token, skipping")
+        return
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/vnd.github.v3+json",
+    }
+
+    # Get existing SHA if file exists
+    sha = None
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            sha = json.loads(resp.read()).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print(f"[GITHUB] Check error {e.code}")
+
+    payload = {
+        "message": commit_msg,
+        "content": base64.b64encode(content_str.encode()).decode(),
+        "branch":  GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        data = json.dumps(payload).encode()
+        req  = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+        with urllib.request.urlopen(req) as resp:
+            print(f"[GITHUB] Pushed {path}")
+    except urllib.error.HTTPError as e:
+        print(f"[GITHUB] Push failed {e.code}: {e.read()}")
+
+
+def push_csv_to_github(symbol):
+    """
+    Push two CSV files for this symbol.
+
+    _prices.csv columns mapped to OHLCV:
+      open=entry, high=ob_high, low=ob_low, close=sl, volume=tp
+
+    _meta.csv columns mapped to OHLCV:
+      open=direction (1=LONG, -1=SHORT)
+      high=status    (1=active, 2=closed_tp, 3=closed_sl)
+      low=rr
+      close=source   (1=v3, 2=modelb)
+      volume=timeframe (60=H1, 15=M15)
+
+    Rows are ordered oldest first (Pine reads newest bar = last row).
+    Row 0 in Pine (offset [0]) = most recent setup = last row in CSV.
+    """
+    setups = store.get(symbol, [])
+    if not setups:
+        return
+
+    # store is newest-first, reverse for CSV (oldest first)
+    ordered = list(reversed(setups))
+
+    # Prices CSV
+    price_lines = ["time,open,high,low,close,volume"]
+    meta_lines  = ["time,open,high,low,close,volume"]
+
+    for i, s in enumerate(ordered):
+        t = s['time_unix']
+
+        dir_val = 1 if s['direction'] == 'LONG' else -1
+        status_map = {'active': 1, 'closed_tp': 2, 'closed_sl': 3}
+        status_val = status_map.get(s['status'], 1)
+        src_val = 1 if s['source'] == 'v3' else 2
+        tf_val  = 60 if s['timeframe'] == 'H1' else 15
+
+        price_lines.append(f"{t},{s['entry']},{s['ob_high']},{s['ob_low']},{s['sl']},{s['tp']}")
+        meta_lines.append(f"{t},{dir_val},{status_val},{s['rr']},{src_val},{tf_val}")
+
+    github_put(f"data/{symbol}_prices.csv", "\n".join(price_lines), f"update {symbol} prices")
+    github_put(f"data/{symbol}_meta.csv",   "\n".join(meta_lines),  f"update {symbol} meta")
 
 
 # ── Routes ───────────────────────────────────────────────────────
@@ -51,33 +122,11 @@ def check_auth():
 @app.route('/health', methods=['GET'])
 def health():
     total = sum(len(v) for v in store.values())
-    return jsonify({
-        'status': 'ok',
-        'time':   datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-        'pairs':  len(store),
-        'setups': total,
-    })
+    return jsonify({'status': 'ok', 'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'pairs': len(store), 'setups': total})
 
 
 @app.route('/setup', methods=['POST'])
 def add_setup():
-    """
-    Called by Python script when a limit order is placed.
-    Expected JSON body:
-    {
-        "symbol":    "GBPJPY",
-        "direction": "SHORT",         # SHORT or LONG
-        "timeframe": "H1",            # H1 or M15
-        "entry":     156.234,
-        "sl":        156.890,
-        "tp":        154.500,
-        "ob_high":   156.780,
-        "ob_low":    156.120,
-        "rr":        2.34,
-        "ticket":    123456789,
-        "source":    "v3"             # v3 or modelb
-    }
-    """
     if not check_auth():
         return jsonify({'error': 'Unauthorised'}), 401
 
@@ -100,30 +149,21 @@ def add_setup():
         'rr':        float(data.get('rr', 0)),
         'ticket':    int(data.get('ticket', 0)),
         'source':    data.get('source', 'unknown'),
-        'status':    'active',        # active | closed_tp | closed_sl | expired
+        'status':    'active',
         'time':      datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
         'time_unix': int(datetime.now(timezone.utc).timestamp()),
     }
 
-    # Prepend (newest first) and cap at MAX_PER_SYMBOL
     store[symbol].insert(0, setup)
     store[symbol] = store[symbol][:MAX_PER_SYMBOL]
+    push_csv_to_github(symbol)
 
-    print(f"[SETUP] {symbol} {setup['direction']} | entry={setup['entry']} | "
-          f"ticket={setup['ticket']} | source={setup['source']}")
+    print(f"[SETUP] {symbol} {setup['direction']} | entry={setup['entry']} | ticket={setup['ticket']}")
     return jsonify({'status': 'ok', 'symbol': symbol, 'total': len(store[symbol])})
 
 
 @app.route('/close', methods=['POST'])
 def close_setup():
-    """
-    Called by Python script when TP or SL is hit.
-    Expected JSON:
-    {
-        "ticket": 123456789,
-        "outcome": "TP"    # TP or SL
-    }
-    """
     if not check_auth():
         return jsonify({'error': 'Unauthorised'}), 401
 
@@ -131,10 +171,11 @@ def close_setup():
     ticket  = int(data.get('ticket', 0))
     outcome = data.get('outcome', 'SL')
 
-    for symbol_setups in store.values():
+    for symbol, symbol_setups in store.items():
         for s in symbol_setups:
             if s['ticket'] == ticket:
                 s['status'] = f'closed_{outcome.lower()}'
+                push_csv_to_github(symbol)
                 print(f"[CLOSE] ticket={ticket} outcome={outcome}")
                 return jsonify({'status': 'ok', 'ticket': ticket, 'outcome': outcome})
 
@@ -143,30 +184,18 @@ def close_setup():
 
 @app.route('/setups/<symbol>', methods=['GET'])
 def get_setups(symbol):
-    """
-    Polled by Pine Script every bar.
-    Returns the last MAX_PER_SYMBOL setups for the symbol.
-    Pine Script uses request.json() to call this.
-    Symbol is case-insensitive.
-    """
-    symbol  = symbol.upper()
-    setups  = store.get(symbol, [])
-    return jsonify({
-        'symbol': symbol,
-        'count':  len(setups),
-        'setups': setups,
-    })
+    symbol = symbol.upper()
+    setups = store.get(symbol, [])
+    return jsonify({'symbol': symbol, 'count': len(setups), 'setups': setups})
 
 
 @app.route('/all', methods=['GET'])
 def get_all():
-    """Returns all stored setups — useful for debugging."""
     if not check_auth():
         return jsonify({'error': 'Unauthorised'}), 401
     return jsonify({s: store[s] for s in store})
 
 
-# ── Entry point ──────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
