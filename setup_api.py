@@ -116,8 +116,8 @@ def push_csv_to_github(symbol):
         price_lines.append(f"{t},{s['entry']},{s['ob_high']},{s['ob_low']},{s['sl']},{s['tp']}")
         meta_lines.append(f"{t},{dir_val},{status_val},{s['rr']},{src_val},{tf_val}")
 
-    github_put(f"data/{symbol}_prices.csv", "\n".join(price_lines), f"update {symbol} prices")
-    github_put(f"data/{symbol}_meta.csv",   "\n".join(meta_lines),  f"update {symbol} meta")
+    github_put(f"{symbol}_prices.csv", "\n".join(price_lines), f"update {symbol} prices")
+    github_put(f"{symbol}_meta.csv",   "\n".join(meta_lines),  f"update {symbol} meta")
 
 
 # ── Routes ───────────────────────────────────────────────────────
