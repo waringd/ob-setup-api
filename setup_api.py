@@ -92,7 +92,10 @@ def push_csv_to_github(symbol):
     """
     setups = store.get(symbol, [])
     if not setups:
+        print(f"[GITHUB] No setups for {symbol}, skipping")
         return
+    
+    print(f"[GITHUB] Starting push for {symbol}, token present: {bool(GITHUB_TOKEN)}")
 
     # store is newest-first, reverse for CSV (oldest first)
     ordered = list(reversed(setups))
