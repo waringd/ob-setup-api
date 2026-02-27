@@ -30,6 +30,22 @@ import urllib.request, urllib.error
 
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    """Handle CORS preflight requests."""
+    return '', 204
+
+
 MAX_PER_SYMBOL = 50          # raised from 10 — we want history
 store = defaultdict(list)    # symbol -> [setup_dict, ...]  (newest first)
 
