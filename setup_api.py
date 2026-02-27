@@ -35,6 +35,7 @@ CORS(app)
 
 MAX_PER_SYMBOL = 50          # raised from 10 — we want history
 store = defaultdict(list)    # symbol -> [setup_dict, ...]  (newest first)
+drawings = defaultdict(list) # symbol -> [drawing_dict, ...]
 
 API_KEY       = os.environ.get('API_KEY', 'changeme')
 GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
@@ -386,10 +387,122 @@ def get_history():
     return jsonify({'trades': all_trades, 'stats': stats})
 
 
+# ── Drawings ─────────────────────────────────────────────────────
+
+def push_drawings_to_github(symbol):
+    """Persist drawings for a symbol as JSON to GitHub."""
+    d = drawings.get(symbol, [])
+    content = json.dumps(d, indent=2)
+    github_put(f"drawings/{symbol}.json", content, f"update {symbol} drawings")
+
+
+def restore_drawings_from_github():
+    """Load all drawing files from GitHub on startup."""
+    print("[RESTORE] Loading drawings from GitHub...")
+    if not GITHUB_TOKEN:
+        print("[RESTORE] No token, skipping drawings")
+        return
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/drawings?ref={GITHUB_BRANCH}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            files = json.loads(resp.read())
+    except Exception as e:
+        print(f"[RESTORE] No drawings/ folder yet: {e}")
+        return
+
+    total = 0
+    for f in files:
+        if not f['name'].endswith('.json'):
+            continue
+        symbol = f['name'].replace('.json', '')
+        content = github_get_file(f"drawings/{f['name']}")
+        if content:
+            try:
+                drawing_list = json.loads(content)
+                drawings[symbol] = drawing_list
+                total += len(drawing_list)
+                print(f"[RESTORE] {symbol}: {len(drawing_list)} drawings")
+            except Exception as e:
+                print(f"[RESTORE] {symbol} drawings failed: {e}")
+
+    print(f"[RESTORE] Drawings done — {total} across {len(drawings)} symbols")
+
+
+@app.route('/drawings/<symbol>', methods=['GET'])
+def get_drawings(symbol):
+    """Get all drawings for a symbol."""
+    if not check_auth():
+        return jsonify({'error': 'Unauthorised'}), 401
+    symbol = symbol.upper()
+    return jsonify({'symbol': symbol, 'drawings': drawings.get(symbol, [])})
+
+
+@app.route('/drawings/<symbol>', methods=['POST'])
+def save_drawing(symbol):
+    """Add a new drawing for a symbol."""
+    if not check_auth():
+        return jsonify({'error': 'Unauthorised'}), 401
+
+    symbol = symbol.upper()
+    data = request.get_json(force=True)
+
+    drawing = {
+        'id':        data.get('id', ''),
+        'type':      data.get('type', 'hline'),       # hline, trendline, rectangle
+        'color':     data.get('color', '#ffffff'),
+        'lineWidth': data.get('lineWidth', 1),
+        'points':    data.get('points', []),           # [{time, price}, ...]
+        'created':   datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+    }
+
+    drawings[symbol].append(drawing)
+    push_drawings_to_github(symbol)
+    print(f"[DRAWING] Added {drawing['type']} on {symbol}")
+    return jsonify({'status': 'ok', 'id': drawing['id']})
+
+
+@app.route('/drawings/<symbol>/<drawing_id>', methods=['DELETE'])
+def delete_drawing(symbol, drawing_id):
+    """Delete a specific drawing by ID."""
+    if not check_auth():
+        return jsonify({'error': 'Unauthorised'}), 401
+
+    symbol = symbol.upper()
+    before = len(drawings.get(symbol, []))
+    drawings[symbol] = [d for d in drawings.get(symbol, []) if d.get('id') != drawing_id]
+    after = len(drawings[symbol])
+
+    if before != after:
+        push_drawings_to_github(symbol)
+        print(f"[DRAWING] Deleted {drawing_id} from {symbol}")
+        return jsonify({'status': 'ok'})
+    return jsonify({'status': 'not_found'}), 404
+
+
+@app.route('/drawings/<symbol>/clear', methods=['POST'])
+def clear_drawings(symbol):
+    """Delete all drawings for a symbol."""
+    if not check_auth():
+        return jsonify({'error': 'Unauthorised'}), 401
+
+    symbol = symbol.upper()
+    drawings[symbol] = []
+    push_drawings_to_github(symbol)
+    print(f"[DRAWING] Cleared all drawings for {symbol}")
+    return jsonify({'status': 'ok'})
+
+
 # ── Startup ──────────────────────────────────────────────────────
 
 with app.app_context():
     restore_from_github()
+    restore_drawings_from_github()
 
 
 if __name__ == '__main__':
