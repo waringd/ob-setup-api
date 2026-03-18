@@ -148,7 +148,8 @@ def restore_from_github():
 
 
 def push_trades_to_github():
-    """Push all trades as a single flat JSON list to GitHub."""
+    """Push all trades as a single flat JSON list to GitHub.
+    Candle data is stripped before persisting to avoid bloating the file."""
     all_trades = []
     for symbol_trades in store.values():
         all_trades.extend(symbol_trades)
@@ -203,6 +204,12 @@ def add_setup():
         'time_unix':  int(now_ts.timestamp()),
         'close_time': '',
     }
+
+    # Candle data: keep in memory for dashboard charts but exclude from
+    # GitHub persistence to avoid bloating trades.json
+    candles = data.get('candles')
+    if candles and isinstance(candles, list):
+        setup['candles'] = candles
 
     store[symbol].insert(0, setup)
     store[symbol] = store[symbol][:MAX_PER_SYMBOL]
