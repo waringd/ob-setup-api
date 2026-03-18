@@ -310,6 +310,31 @@ def get_history():
     return jsonify({'trades': all_trades, 'stats': stats})
 
 
+@app.route('/backfill-candles', methods=['POST'])
+def backfill_candles():
+    """Patch candle data onto an existing setup by ticket number.
+    Used by the one-off backfill script — does not create new setups."""
+    if not check_auth():
+        return jsonify({'error': 'Unauthorised'}), 401
+
+    data    = request.get_json(force=True)
+    ticket  = int(data.get('ticket', 0))
+    candles = data.get('candles')
+
+    if not ticket or not candles:
+        return jsonify({'error': 'ticket and candles required'}), 400
+
+    for symbol_setups in store.values():
+        for s in symbol_setups:
+            if s['ticket'] == ticket:
+                s['candles'] = candles
+                push_trades_to_github()
+                print(f"[BACKFILL] ticket={ticket} — {len(candles)} candles added")
+                return jsonify({'status': 'ok', 'ticket': ticket})
+
+    return jsonify({'status': 'not_found', 'ticket': ticket}), 404
+
+
 # ── Drawings ─────────────────────────────────────────────────────
 
 def push_drawings_to_github(symbol):
